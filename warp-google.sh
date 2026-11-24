@@ -9,7 +9,7 @@
 #    - Cloudflare API 通信自适应走 IPv6 / IPv4
 #    - WireGuard 端点智能优选 Anycast IPv6 ([2606:4700:d0::...])
 #    - Dnsmasq 上游双栈/IPv6 DNS 防断网兜底
-#    - 赋予纯 IPv6 机子完整的全局 IPv4 出口访问能力
+#    - 单栈 IPv6 下将 warp0 设为全局默认 IPv4 网关，彻底打通 IPv4 出网访问
 # 2. 权威高精度送中判定：
 #    - 深度对齐 NodeQuality / IPQuality / 融合怪 行业通用判定算法
 #    - 基于 YouTube Premium 原生接口与 Google 搜索多维交叉验证
@@ -150,7 +150,12 @@ EOF
 
     # 5. 彻底循环清理 IPv4 与 IPv6 策略路由表与规则
     while ip rule del fwmark 51820 lookup 51820 2>/dev/null; do :; done
+    while ip rule del oif warp0 lookup 51820 2>/dev/null; do :; done
+    while ip rule del from 172.16.0.0/12 lookup 51820 2>/dev/null; do :; done
+    while ip rule del lookup 51820 priority 200 2>/dev/null; do :; done
     while ip -6 rule del fwmark 51820 lookup 51820 2>/dev/null; do :; done
+    while ip -6 rule del oif warp0 lookup 51820 2>/dev/null; do :; done
+    ip route del default dev warp0 table main 2>/dev/null || true
     ip route flush table 51820 2>/dev/null || true
     ip -6 route flush table 51820 2>/dev/null || true
 
@@ -328,15 +333,27 @@ setup_warp_profile() {
       -d "{\"key\":\"$PUBKEY\",\"install_id\":\"$INSTALL_ID\",\"fcm_token\":\"$FCM_TOKEN\",\"tos\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\",\"model\":\"PC\",\"serial_number\":\"$INSTALL_ID\",\"locale\":\"en_US\"}" \
       https://api.cloudflareclient.com/v0a2158/reg 2>/dev/null)
 
-    local IPV4_ADDR="172.16.0.2"
+    local IPV4_ADDR
+    IPV4_ADDR=$(python3 -c "import sys, json; print(json.loads(sys.stdin.read()).get('config',{}).get('interface',{}).get('addresses',{}).get('v4',''))" <<< "$RESPONSE" 2>/dev/null)
+    [ -z "$IPV4_ADDR" ] && IPV4_ADDR=$(echo "$RESPONSE" | grep -oP '"addresses"\s*:\s*\{[^}]*"v4"\s*:\s*"\K[0-9.]+' | head -n 1)
+    IPV4_ADDR=${IPV4_ADDR:-172.16.0.2}
+
     local IPV6_ADDR
     IPV6_ADDR=$(python3 -c "import sys, json; print(json.loads(sys.stdin.read()).get('config',{}).get('interface',{}).get('addresses',{}).get('v6',''))" <<< "$RESPONSE" 2>/dev/null)
     [ -z "$IPV6_ADDR" ] && IPV6_ADDR=$(echo "$RESPONSE" | grep -oP '"addresses"\s*:\s*\{[^}]*"v6"\s*:\s*"\K[0-9a-fA-F:]+' | head -n 1)
     IPV6_ADDR=${IPV6_ADDR:-2606:4700:110:8827:18b5:2de8:8b53:96e3}
 
     local PEER_PUBKEY
-    PEER_PUBKEY=$(echo "$RESPONSE" | grep -oP '"public_key"\s*:\s*"\K[^"]+' | head -n 1)
+    PEER_PUBKEY=$(python3 -c "import sys, json; print(json.loads(sys.stdin.read()).get('config',{}).get('peers',[])[0].get('public_key',''))" <<< "$RESPONSE" 2>/dev/null)
+    [ -z "$PEER_PUBKEY" ] && PEER_PUBKEY=$(echo "$RESPONSE" | grep -oP '"public_key"\s*:\s*"\K[^"]+' | head -n 1)
     PEER_PUBKEY=${PEER_PUBKEY:-bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=}
+
+    # 尝试从 API 中自动提取 Cloudflare 推荐的 IPv6 端点
+    if [ $IS_V6_ONLY -eq 1 ]; then
+        local CF_V6_EP
+        CF_V6_EP=$(python3 -c "import sys, json; print(json.loads(sys.stdin.read()).get('config',{}).get('peers',[])[0].get('endpoint',{}).get('v6',''))" <<< "$RESPONSE" 2>/dev/null)
+        [ -n "$CF_V6_EP" ] && TARGET_EP="$CF_V6_EP"
+    fi
 
     # 备用 API 兜底
     if [ -z "$RESPONSE" ] || echo "$RESPONSE" | grep -q '"success":false'; then
@@ -378,16 +395,21 @@ TOKEN=$TOKEN
 EOF
     fi
 
+    # 构建针对单栈 IPv6 与双栈自适应的 PostUp 规则
+    local V6_ONLY_EXTRA_POSTUP=""
+    if [ $IS_V6_ONLY -eq 1 ]; then
+        V6_ONLY_EXTRA_POSTUP="ip route replace default dev warp0 table main 2>/dev/null || true; ip rule add lookup 51820 priority 200 2>/dev/null || true;"
+    fi
+
     # 显式设置 MTU=1200 杜绝大包分片断网，Keepalive=10 彻底稳固 NAT 映射
-    # PostUp 绑定 IPv4 与 IPv6 策略路由、MASQUERADE 与 TCPMSS 钳制
     cat > /etc/wireguard/warp0.conf << EOF
 [Interface]
 PrivateKey = $PRIVKEY
 Address = ${IPV4_ADDR}/32, ${IPV6_ADDR}/128
 MTU = 1200
 Table = off
-PostUp = ip rule add fwmark 51820 lookup 51820 priority 100 2>/dev/null || true; ip route replace default dev warp0 table 51820; iptables -t nat -D POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null || true; iptables -t nat -A POSTROUTING -o warp0 -j MASQUERADE; iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true; iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu; ip -6 rule add fwmark 51820 lookup 51820 priority 100 2>/dev/null || true; ip -6 route replace default dev warp0 table 51820 2>/dev/null || true; ip6tables -t nat -D POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null || true; ip6tables -t nat -A POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null || true; ip6tables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true; ip6tables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
-PostDown = ip route flush table 51820 2>/dev/null || true; ip -6 route flush table 51820 2>/dev/null || true
+PostUp = ip rule add fwmark 51820 lookup 51820 priority 100 2>/dev/null || true; ip rule add oif warp0 lookup 51820 priority 90 2>/dev/null || true; ip rule add from 172.16.0.0/12 lookup 51820 priority 90 2>/dev/null || true; ip route replace default dev warp0 table 51820; ${V6_ONLY_EXTRA_POSTUP} iptables -t nat -D POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null || true; iptables -t nat -A POSTROUTING -o warp0 -j MASQUERADE; iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true; iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu; ip -6 rule add fwmark 51820 lookup 51820 priority 100 2>/dev/null || true; ip -6 rule add oif warp0 lookup 51820 priority 90 2>/dev/null || true; ip -6 rule add from ${IPV6_ADDR} lookup 51820 priority 90 2>/dev/null || true; ip -6 route replace default dev warp0 table 51820 2>/dev/null || true; ip6tables -t nat -D POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null || true; ip6tables -t nat -A POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null || true; ip6tables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true; ip6tables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+PostDown = ip route del default dev warp0 table main 2>/dev/null || true; ip route flush table 51820 2>/dev/null || true; ip -6 route flush table 51820 2>/dev/null || true; ip rule del oif warp0 lookup 51820 2>/dev/null || true; ip rule del from 172.16.0.0/12 lookup 51820 2>/dev/null || true; ip rule del lookup 51820 priority 200 2>/dev/null || true; ip -6 rule del oif warp0 lookup 51820 2>/dev/null || true; ip -6 rule del from ${IPV6_ADDR} lookup 51820 2>/dev/null || true
 
 [Peer]
 PublicKey = ${PEER_PUBKEY:-bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=}
@@ -551,15 +573,29 @@ for net6 in 2001:4860::/32 2607:f8b0::/32 2a00:1450::/32 2800:3f0::/32 2404:6800
     ipset add warp_unlock6 "\$net6" -exist 2>/dev/null || true
 done
 
-# 2. 创建专用路由表 51820 (IPv4 & IPv6 双栈)
+# 2. 创建专用路由表 51820 (IPv4 & IPv6 双栈策略规则)
 ip rule del fwmark 51820 lookup 51820 2>/dev/null || true
 ip rule add fwmark 51820 lookup 51820 priority 100
+ip rule del oif warp0 lookup 51820 2>/dev/null || true
+ip rule add oif warp0 lookup 51820 priority 90 2>/dev/null || true
+ip rule del from 172.16.0.0/12 lookup 51820 2>/dev/null || true
+ip rule add from 172.16.0.0/12 lookup 51820 priority 90 2>/dev/null || true
+
 ip -6 rule del fwmark 51820 lookup 51820 2>/dev/null || true
 ip -6 rule add fwmark 51820 lookup 51820 priority 100 2>/dev/null || true
+ip -6 rule del oif warp0 lookup 51820 2>/dev/null || true
+ip -6 rule add oif warp0 lookup 51820 priority 90 2>/dev/null || true
 
 # 3. 启动 WireGuard 虚拟网卡并进行握手建立
 wg-quick down warp0 >/dev/null 2>&1 || true
 wg-quick up warp0 >/dev/null 2>&1
+
+# 主动发包触发 WireGuard 握手建立
+ping -c 1 -W 1 1.1.1.1 >/dev/null 2>&1 || true
+curl -s -m 2 --interface warp0 https://1.1.1.1 >/dev/null 2>&1 || true
+
+PEER_KEY=\$(wg show warp0 peers 2>/dev/null | head -n 1)
+PEER_KEY=\${PEER_KEY:-bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=}
 
 # 稳定等待接入点握手建立 (最多等 6 秒)
 HANDSHAKE_OK=0
@@ -575,7 +611,8 @@ done
 # 若主节点未响应，平滑热切备用节点再次等待
 if [ \$HANDSHAKE_OK -eq 0 ]; then
     for ep in "$ALT_EP1" "$ALT_EP2"; do
-        wg set warp0 peer bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo= endpoint "\$ep" 2>/dev/null || true
+        wg set warp0 peer "\$PEER_KEY" endpoint "\$ep" 2>/dev/null || true
+        ping -c 1 -W 1 1.1.1.1 >/dev/null 2>&1 || true
         for s in \$(seq 1 4); do
             sleep 1
             RX=\$(wg show warp0 transfer 2>/dev/null | awk '{print \$2}')
@@ -598,6 +635,13 @@ ip route flush table 51820 2>/dev/null || true
 ip route replace default dev warp0 table 51820
 ip -6 route flush table 51820 2>/dev/null || true
 ip -6 route replace default dev warp0 table 51820 2>/dev/null || true
+
+# 单栈 IPv6 VPS 特别处理：将全局 IPv4 默认路由赋给 warp0
+if [ "$IS_V6_ONLY" -eq 1 ]; then
+    ip route replace default dev warp0 table main 2>/dev/null || true
+    ip rule del lookup 51820 priority 200 2>/dev/null || true
+    ip rule add lookup 51820 priority 200 2>/dev/null || true
+fi
 
 # 5. iptables / ip6tables 标记匹配 ipset 的流量
 iptables -t mangle -D OUTPUT -m set --match-set warp_unlock dst -j MARK --set-mark 51820 2>/dev/null || true
@@ -661,7 +705,8 @@ refresh_warp_ip() {
     echo -e "\n${CYAN}>>> 正在执行 WARP 出口 IP 深度换新 (注销旧设备 -> 注入随机指纹 -> 获取全新出口 IP)...${NC}"
 
     local OLD_IP
-    OLD_IP=$(curl -s --interface warp0 --max-time 4 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep "^ip=" | cut -d= -f2)
+    OLD_IP=$(curl -s -4 --interface warp0 --max-time 4 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep "^ip=" | cut -d= -f2)
+    [ -z "$OLD_IP" ] && OLD_IP=$(curl -s --interface warp0 --max-time 4 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep "^ip=" | cut -d= -f2)
     [ -n "$OLD_IP" ] && echo -e "当前旧出口 IP: ${YELLOW}${OLD_IP}${NC}"
 
     # 1. 停用当前 WireGuard 接口
@@ -700,14 +745,25 @@ refresh_warp_ip() {
       -d "{\"key\":\"$PUBKEY\",\"install_id\":\"$INSTALL_ID\",\"fcm_token\":\"$FCM_TOKEN\",\"tos\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\",\"model\":\"PC\",\"serial_number\":\"$INSTALL_ID\",\"locale\":\"en_US\"}" \
       https://api.cloudflareclient.com/v0a2158/reg 2>/dev/null)
 
-    local NEW_DEV_ID NEW_TOKEN IPV6_ADDR PEER_PUBKEY
+    local NEW_DEV_ID NEW_TOKEN IPV4_ADDR IPV6_ADDR PEER_PUBKEY
     NEW_DEV_ID=$(echo "$REG_RES" | grep -oP '"id"\s*:\s*"\K[^"]+' | head -n 1)
     NEW_TOKEN=$(echo "$REG_RES" | grep -oP '"token"\s*:\s*"\K[^"]+' | head -n 1)
+    IPV4_ADDR=$(python3 -c "import sys, json; print(json.loads(sys.stdin.read()).get('config',{}).get('interface',{}).get('addresses',{}).get('v4',''))" <<< "$REG_RES" 2>/dev/null)
+    [ -z "$IPV4_ADDR" ] && IPV4_ADDR=$(echo "$REG_RES" | grep -oP '"addresses"\s*:\s*\{[^}]*"v4"\s*:\s*"\K[0-9.]+' | head -n 1)
+    IPV4_ADDR=${IPV4_ADDR:-172.16.0.2}
+
     IPV6_ADDR=$(python3 -c "import sys, json; print(json.loads(sys.stdin.read()).get('config',{}).get('interface',{}).get('addresses',{}).get('v6',''))" <<< "$REG_RES" 2>/dev/null)
     [ -z "$IPV6_ADDR" ] && IPV6_ADDR=$(echo "$REG_RES" | grep -oP '"addresses"\s*:\s*\{[^}]*"v6"\s*:\s*"\K[0-9a-fA-F:]+' | head -n 1)
     IPV6_ADDR=${IPV6_ADDR:-2606:4700:110:8827:18b5:2de8:8b53:96e3}
     PEER_PUBKEY=$(echo "$REG_RES" | grep -oP '"public_key"\s*:\s*"\K[^"]+' | head -n 1)
     PEER_PUBKEY=${PEER_PUBKEY:-bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=}
+
+    # 若为单栈 IPv6 则尝试获取动态推荐 IPv6 端点
+    if [ $IS_V6_ONLY -eq 1 ]; then
+        local CF_V6_EP
+        CF_V6_EP=$(python3 -c "import sys, json; print(json.loads(sys.stdin.read()).get('config',{}).get('peers',[])[0].get('endpoint',{}).get('v6',''))" <<< "$REG_RES" 2>/dev/null)
+        [ -n "$CF_V6_EP" ] && TARGET_EP="$CF_V6_EP"
+    fi
 
     # 6. 激活新账号授权
     if [ -n "$NEW_DEV_ID" ] && [ -n "$NEW_TOKEN" ]; then
@@ -724,7 +780,7 @@ EOF
 
     # 7. 更新 /etc/wireguard/warp0.conf
     sed -i "s|PrivateKey = .*|PrivateKey = $PRIVKEY|" /etc/wireguard/warp0.conf
-    sed -i "s|Address = .*|Address = 172.16.0.2/32, ${IPV6_ADDR}/128|" /etc/wireguard/warp0.conf
+    sed -i "s|Address = .*|Address = ${IPV4_ADDR}/32, ${IPV6_ADDR}/128|" /etc/wireguard/warp0.conf
     [ -n "$PEER_PUBKEY" ] && sed -i "s|PublicKey = .*|PublicKey = $PEER_PUBKEY|" /etc/wireguard/warp0.conf
     sed -i "s|Endpoint = .*|Endpoint = $TARGET_EP|" /etc/wireguard/warp0.conf
 
@@ -732,9 +788,10 @@ EOF
     wg-quick up warp0 >/dev/null 2>&1
     sleep 3
 
-    # 9. 验收全新出口 IP 与地区归属
+    # 9. 验收全新出口 IP 与地区归属 (优先通过 IPv4 trace)
     local NEW_TRACE NEW_IP NEW_LOC NEW_GLOC
-    NEW_TRACE=$(curl -s --interface warp0 --max-time 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+    NEW_TRACE=$(curl -s -4 --interface warp0 --max-time 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+    [ -z "$NEW_TRACE" ] && NEW_TRACE=$(curl -s --interface warp0 --max-time 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
     NEW_IP=$(echo "$NEW_TRACE" | grep "^ip=" | cut -d= -f2)
     NEW_LOC=$(echo "$NEW_TRACE" | grep "^loc=" | cut -d= -f2)
     NEW_GLOC=$(curl -sL --interface warp0 --max-time 5 -H "Accept-Language: en-US,en" https://www.google.com 2>/dev/null | grep -oP '\[1,null,null,\d+,\d+,"\K[A-Z]{3}' | head -n 1)
@@ -767,9 +824,10 @@ ensure_clean_warp_region() {
     while [ $retry_count -lt $max_retries ]; do
         sleep 2
 
-        # 1. 获取 Cloudflare 官方权威 trace 信息与出口公网 IP
+        # 1. 获取 Cloudflare 官方权威 trace 信息与出口公网 IP (优先 IPv4，若无则自适应)
         local TRACE_INFO
-        TRACE_INFO=$(curl -s --interface warp0 --max-time 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+        TRACE_INFO=$(curl -s -4 --interface warp0 --max-time 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+        [ -z "$TRACE_INFO" ] && TRACE_INFO=$(curl -s --interface warp0 --max-time 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
         local WARP_IP
         WARP_IP=$(echo "$TRACE_INFO" | grep "^ip=" | cut -d= -f2)
         local CF_LOC
@@ -841,10 +899,14 @@ test_unlock_status() {
         echo -e "${GREEN}✓ WireGuard 隧道运行正常 (累计接收: ${RX_BYTES} 字节)${NC}"
     fi
 
-    # 获取 WARP 虚拟接口出口 IP 信息
+    # 获取 WARP 虚拟接口出口 IP 信息 (双重兜底探测)
     local WARP_V4_EXIT WARP_V6_EXIT
     WARP_V4_EXIT=$(curl -s -4 --interface warp0 --max-time 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep "^ip=" | cut -d= -f2)
+    [ -z "$WARP_V4_EXIT" ] && WARP_V4_EXIT=$(curl -s -4 --interface warp0 --max-time 5 https://api.ip.sb/ip 2>/dev/null | tr -d '\r\n ')
+    [ -z "$WARP_V4_EXIT" ] && WARP_V4_EXIT=$(curl -s -4 --interface warp0 --max-time 5 https://ipinfo.io/ip 2>/dev/null | tr -d '\r\n ')
+
     WARP_V6_EXIT=$(curl -s -6 --interface warp0 --max-time 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep "^ip=" | cut -d= -f2)
+    [ -z "$WARP_V6_EXIT" ] && WARP_V6_EXIT=$(curl -s -6 --interface warp0 --max-time 5 https://api64.ipify.org 2>/dev/null | tr -d '\r\n ')
 
     # 1. 验证 YouTube 解锁
     local YT_TEST
