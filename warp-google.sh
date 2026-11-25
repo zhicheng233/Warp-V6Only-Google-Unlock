@@ -43,12 +43,12 @@ detect_network_environment() {
 
     # 排除 warp, wg, tun 等虚拟网卡，提取原生物理/默认网卡
     local PHYS_V4_IFACE PHYS_V6_IFACE
-    PHYS_V4_IFACE=$(ip -4 route show default 2>/dev/null | grep -Ev '\bdev (warp[0-9]*|wg[0-9]*|tun[0-9]*)\b' | grep -oP 'dev \K\S+' | head -n 1)
-    PHYS_V6_IFACE=$(ip -6 route show default 2>/dev/null | grep -Ev '\bdev (warp[0-9]*|wg[0-9]*|tun[0-9]*)\b' | grep -oP 'dev \K\S+' | head -n 1)
+    PHYS_V4_IFACE=$(ip -4 route show default 2>/dev/null | grep -Ev '\bdev (warp|wg|tun)[^ ]*' | grep -oP 'dev \K\S+' | head -n 1)
+    PHYS_V6_IFACE=$(ip -6 route show default 2>/dev/null | grep -Ev '\bdev (warp|wg|tun)[^ ]*' | grep -oP 'dev \K\S+' | head -n 1)
 
     DEFAULT_IFACE="$PHYS_V4_IFACE"
     [ -z "$DEFAULT_IFACE" ] && DEFAULT_IFACE="$PHYS_V6_IFACE"
-    [ -z "$DEFAULT_IFACE" ] && DEFAULT_IFACE=$(ip route show default 2>/dev/null | grep -Ev '\bdev (warp[0-9]*|wg[0-9]*|tun[0-9]*)\b' | awk '{print $5}' | head -n 1)
+    [ -z "$DEFAULT_IFACE" ] && DEFAULT_IFACE=$(ip route show default 2>/dev/null | grep -Ev '\bdev (warp|wg|tun)[^ ]*' | awk '{print $5}' | head -n 1)
     [ -z "$DEFAULT_IFACE" ] && DEFAULT_IFACE=$(ip link show 2>/dev/null | grep -E '^[0-9]+: (eth|ens|enp|eno|venet)' | awk -F': ' '{print $2}' | cut -d'@' -f1 | head -n 1)
 
     local IFACE_V4_ARG="" IFACE_V6_ARG=""
@@ -106,6 +106,75 @@ detect_network_environment() {
 }
 
 detect_network_environment
+
+# WARP 的两套地址始终保留供隧道诊断；策略决定哪些协议实际走 WARP。
+WARP_POLICY_FILE=/etc/warp-unlock/exit-policy.conf
+WARP_FAMILY=both
+WARP_SCOPE=split
+ADDRESS_PREFERENCE=default
+
+load_exit_policy() {
+    [ -f "$WARP_POLICY_FILE" ] || return 0
+    local value
+    value=$(sed -n 's/^family=//p' "$WARP_POLICY_FILE" | head -n 1)
+    case "$value" in ipv4|ipv6|both) WARP_FAMILY=$value ;; esac
+    value=$(sed -n 's/^scope=//p' "$WARP_POLICY_FILE" | head -n 1)
+    case "$value" in split|global) WARP_SCOPE=$value ;; esac
+    value=$(sed -n 's/^preference=//p' "$WARP_POLICY_FILE" | head -n 1)
+    case "$value" in default|ipv4|ipv6) ADDRESS_PREFERENCE=$value ;; esac
+}
+
+select_exit_policy() {
+    local answer
+    load_exit_policy
+    echo "WARP 出口协议：1 IPv4  2 IPv6  3 双栈 (默认 3)"
+    read -r -p '请选择 [1-3]: ' answer
+    case "${answer:-3}" in 1) WARP_FAMILY=ipv4 ;; 2) WARP_FAMILY=ipv6 ;; 3) WARP_FAMILY=both ;; *) echo '无效选择'; return 1 ;; esac
+    echo "出口范围：1 目标服务分流  2 全局 WARP (默认 1)"
+    read -r -p '请选择 [1-2]: ' answer
+    case "${answer:-1}" in 1) WARP_SCOPE=split ;; 2) WARP_SCOPE=global ;; *) echo '无效选择'; return 1 ;; esac
+    echo "本机连接优先级：1 系统默认  2 IPv4 优先  3 IPv6 优先 (默认 1)"
+    read -r -p '请选择 [1-3]: ' answer
+    case "${answer:-1}" in 1) ADDRESS_PREFERENCE=default ;; 2) ADDRESS_PREFERENCE=ipv4 ;; 3) ADDRESS_PREFERENCE=ipv6 ;; *) echo '无效选择'; return 1 ;; esac
+    if [ "$ADDRESS_PREFERENCE" != default ] && [ -f /etc/gai.conf ] &&
+       sed '/^# BEGIN warp-unlock preference$/,/^# END warp-unlock preference$/d' /etc/gai.conf | grep -Eq '^[[:space:]]*precedence[[:space:]]'; then
+        echo '已有自定义 /etc/gai.conf precedence；请先手动处理，避免覆盖现有优先级。'
+        return 1
+    fi
+    mkdir -p /etc/warp-unlock
+    printf 'family=%s\nscope=%s\npreference=%s\n' "$WARP_FAMILY" "$WARP_SCOPE" "$ADDRESS_PREFERENCE" > "$WARP_POLICY_FILE"
+}
+
+# 更新 gai.conf 时只移除本脚本管理的区块，保留管理员的其他设置。
+apply_address_preference() {
+    local tmp
+    tmp=$(mktemp /etc/gai.conf.warp.XXXXXX) || return 1
+    if [ -f /etc/gai.conf ]; then
+        sed '/^# BEGIN warp-unlock preference$/,/^# END warp-unlock preference$/d' /etc/gai.conf > "$tmp"
+    fi
+    if [ "$ADDRESS_PREFERENCE" != default ]; then
+        if grep -Eq '^[[:space:]]*precedence[[:space:]]' "$tmp"; then
+            rm -f "$tmp"
+            echo '[错误] /etc/gai.conf 已存在自定义 precedence。' >&2
+            return 1
+        fi
+        cat >> "$tmp" << EOF
+# BEGIN warp-unlock preference
+precedence ::1/128 50
+precedence ::/0 40
+precedence 2002::/16 30
+precedence ::/96 20
+precedence ::ffff:0:0/96 $([ "$ADDRESS_PREFERENCE" = ipv4 ] && echo 100 || echo 10)
+# END warp-unlock preference
+EOF
+    fi
+    if [ -f /etc/gai.conf ]; then
+        cat "$tmp" > /etc/gai.conf || { rm -f "$tmp"; return 1; }
+    else
+        cp "$tmp" /etc/gai.conf || { rm -f "$tmp"; return 1; }
+    fi
+    rm -f "$tmp"
+}
 
 # ---------------------------------------------------------
 # 功能 1：彻底检测并清理老版本脚本及各种历史残留
@@ -170,13 +239,19 @@ EOF
 
     # 5. 彻底循环清理 IPv4 与 IPv6 策略路由表与规则
     while ip rule del fwmark 51820 lookup 51820 2>/dev/null; do :; done
+    while ip rule del fwmark 51819 lookup main priority 80 2>/dev/null; do :; done
     while ip rule del oif warp0 lookup 51820 2>/dev/null; do :; done
     while ip rule del from 172.16.0.0/12 lookup 51820 2>/dev/null; do :; done
     while ip rule del lookup 51820 priority 200 2>/dev/null; do :; done
     while ip rule del lookup 51820 2>/dev/null; do :; done
     while ip -6 rule del fwmark 51820 lookup 51820 2>/dev/null; do :; done
+    while ip -6 rule del fwmark 51819 lookup main priority 80 2>/dev/null; do :; done
     while ip -6 rule del oif warp0 lookup 51820 2>/dev/null; do :; done
     while ip -6 rule del lookup 51820 2>/dev/null; do :; done
+    while ip rule del priority 190 lookup main suppress_prefixlength 0 2>/dev/null; do :; done
+    while ip rule del priority 188 lookup main 2>/dev/null; do :; done
+    while ip -6 rule del priority 190 lookup main suppress_prefixlength 0 2>/dev/null; do :; done
+    while ip -6 rule del priority 188 lookup main 2>/dev/null; do :; done
     ip route del default dev warp0 table main 2>/dev/null || true
     ip route flush table 51820 2>/dev/null || true
     ip -6 route flush table 51820 2>/dev/null || true
@@ -190,21 +265,15 @@ EOF
           /etc/dnsmasq.d/warp-google.conf \
           /etc/dnsmasq.d/warp*.conf \
           /usr/local/bin/warp-route-apply.sh \
-          /usr/local/bin/wgcf \
           /etc/systemd/system/warp-unlock.service \
           /etc/wireguard/warp0.conf* \
           /etc/wireguard/warp-account.conf* \
           /etc/wireguard/warp.conf* \
-          /usr/bin/wireguard-go \
           /etc/warp-unlock/wgcf-profile.conf \
           /tmp/auto_warp*.sh \
           /tmp/scan_us*.sh \
           /tmp/best_endpoint \
           /tmp/warp* 2>/dev/null || true
-
-    if [ -f /usr/bin/wg-quick ]; then
-        sed -i '/wireguard-go/d; s/^#\s*add_if/add_if/' /usr/bin/wg-quick 2>/dev/null || true
-    fi
 
     systemctl daemon-reload 2>/dev/null || true
     # 彻底清理后立即重新同步网络环境参数
@@ -441,9 +510,7 @@ EOF
 
     # 构建针对单栈 IPv6 与双栈自适应的 PostUp 规则
     local V6_ONLY_EXTRA_POSTUP=""
-    if [ $IS_V6_ONLY -eq 1 ]; then
-        V6_ONLY_EXTRA_POSTUP="ip route replace default dev warp0 table main 2>/dev/null || true; ip rule add lookup 51820 priority 200 2>/dev/null || true;"
-    fi
+    # 默认路由由策略脚本管理；绝不让 WireGuard 的外层连接进入自身隧道。
 
     # IPv6 要求接口 MTU 至少 1280；过低会导致内核禁用接口 IPv6。
     ( umask 077; cat > /etc/wireguard/warp0.conf << EOF
@@ -452,6 +519,7 @@ PrivateKey = $PRIVKEY
 Address = ${IPV4_ADDR}/32, ${IPV6_ADDR}/128
 MTU = 1280
 Table = off
+FwMark = 51819
 PostUp = ip rule add fwmark 51820 lookup 51820 priority 100 2>/dev/null || true; ip rule add oif warp0 lookup 51820 priority 90 2>/dev/null || true; ip rule add from 172.16.0.0/12 lookup 51820 priority 90 2>/dev/null || true; ip route replace default dev warp0 table 51820; ${V6_ONLY_EXTRA_POSTUP} iptables -t nat -D POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null || true; iptables -t nat -A POSTROUTING -o warp0 -j MASQUERADE; iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true; iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu; ip -6 rule add fwmark 51820 lookup 51820 priority 100 2>/dev/null || true; ip -6 rule add oif warp0 lookup 51820 priority 90 2>/dev/null || true; ip -6 rule add from ${IPV6_ADDR} lookup 51820 priority 90 2>/dev/null || true; ip -6 route replace default dev warp0 table 51820 2>/dev/null || true; ip6tables -t nat -D POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null || true; ip6tables -t nat -A POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null || true; ip6tables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true; ip6tables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
 PostDown = ip route del default dev warp0 table main 2>/dev/null || true; ip route flush table 51820 2>/dev/null || true; ip -6 route flush table 51820 2>/dev/null || true; ip rule del oif warp0 lookup 51820 2>/dev/null || true; ip rule del from 172.16.0.0/12 lookup 51820 2>/dev/null || true; ip rule del lookup 51820 priority 200 2>/dev/null || true; ip -6 rule del oif warp0 lookup 51820 2>/dev/null || true; ip -6 rule del from ${IPV6_ADDR} lookup 51820 2>/dev/null || true
 
@@ -589,6 +657,25 @@ EOF
 # ---------------------------------------------------------
 setup_routing_rules() {
     echo -e "\n${CYAN}[4/4] 正在配置系统底层动态路由与开机守护...${NC}"
+    load_exit_policy
+    if [ "$WARP_FAMILY" != ipv6 ]; then
+        local warp_v4 conflicting_iface
+        warp_v4=$(sed -n 's/^Address[[:space:]]*=[[:space:]]*\([^/, ]*\).*/\1/p' /etc/wireguard/warp0.conf | head -n 1)
+        conflicting_iface=$(ip -4 -o addr show 2>/dev/null | awk -v addr="$warp_v4" '$2 != "warp0" && $4 ~ ("^" addr "/") {print $2; exit}')
+        if [ -n "$warp_v4" ] && [ -n "$conflicting_iface" ]; then
+            echo -e "${RED}[错误] $conflicting_iface 已使用 $warp_v4，可能拦截 warp0 的 IPv4 回包；请先处理现有隧道的地址冲突。${NC}"
+            return 1
+        fi
+    fi
+    apply_address_preference || return 1
+    # 兼容旧配置：去掉旧版强制 IPv4 全局路由，加入隧道外层标记。
+    sed -i 's/ip route replace default dev warp0 table main 2>\/dev\/null || true; ip rule add lookup 51820 priority 200 2>\/dev\/null || true;//' /etc/wireguard/warp0.conf
+    sed -i 's/ip rule add from 172\.16\.0\.0\/12 lookup 51820 priority 90 2>\/dev\/null || true;//' /etc/wireguard/warp0.conf
+    if grep -q '^FwMark[[:space:]]*=' /etc/wireguard/warp0.conf; then
+        sed -i 's/^FwMark[[:space:]]*=.*/FwMark = 51819/' /etc/wireguard/warp0.conf
+    else
+        sed -i '/^Table = off/a FwMark = 51819' /etc/wireguard/warp0.conf
+    fi
 
     cat > /usr/local/bin/warp-route-apply.sh << EOF
 #!/bin/bash
@@ -619,12 +706,15 @@ for net6 in 2001:4860::/32 2607:f8b0::/32 2a00:1450::/32 2800:3f0::/32 2404:6800
 done
 
 # 2. 创建专用路由表 51820 (IPv4 & IPv6 双栈策略规则)
+while ip rule del fwmark 51819 lookup main priority 80 2>/dev/null; do :; done
+ip rule add fwmark 51819 lookup main priority 80
+while ip -6 rule del fwmark 51819 lookup main priority 80 2>/dev/null; do :; done
+ip -6 rule add fwmark 51819 lookup main priority 80
 ip rule del fwmark 51820 lookup 51820 2>/dev/null || true
 ip rule add fwmark 51820 lookup 51820 priority 100
 ip rule del oif warp0 lookup 51820 2>/dev/null || true
 ip rule add oif warp0 lookup 51820 priority 90 2>/dev/null || true
 ip rule del from 172.16.0.0/12 lookup 51820 2>/dev/null || true
-ip rule add from 172.16.0.0/12 lookup 51820 priority 90 2>/dev/null || true
 
 ip -6 rule del fwmark 51820 lookup 51820 2>/dev/null || true
 ip -6 rule add fwmark 51820 lookup 51820 priority 100 2>/dev/null || true
@@ -644,11 +734,26 @@ ip route replace default dev warp0 table 51820
 ip -6 route flush table 51820 2>/dev/null || true
 ip -6 route replace default dev warp0 table 51820 2>/dev/null || true
 
-# 单栈 IPv6 VPS 特别处理：将全局 IPv4 默认路由赋给 warp0
-if [ "$IS_V6_ONLY" -eq 1 ]; then
-    ip route replace default dev warp0 table main 2>/dev/null || true
-    ip rule del lookup 51820 priority 200 2>/dev/null || true
-    ip rule add lookup 51820 priority 200 2>/dev/null || true
+# 优先使用单独策略规则，外层 WireGuard 数据包带 51819 标记并走原生网络。
+while ip rule del lookup 51820 priority 200 2>/dev/null; do :; done
+while ip -6 rule del lookup 51820 priority 200 2>/dev/null; do :; done
+while ip rule del priority 190 lookup main suppress_prefixlength 0 2>/dev/null; do :; done
+while ip rule del priority 188 lookup main 2>/dev/null; do :; done
+while ip -6 rule del priority 190 lookup main suppress_prefixlength 0 2>/dev/null; do :; done
+while ip -6 rule del priority 188 lookup main 2>/dev/null; do :; done
+ip route del default dev warp0 table main 2>/dev/null || true
+if [ "$WARP_FAMILY" != ipv6 ] && { [ "$WARP_SCOPE" = global ] || [ "$IS_V6_ONLY" -eq 1 ]; }; then
+    ip rule add priority 190 lookup main suppress_prefixlength 0
+    native_v4=\$(ip -4 route get 1.1.1.1 mark 51819 2>/dev/null | sed -n 's/.* src \([^ ]*\).*/\1/p' | head -n 1)
+    [ -n "\$native_v4" ] && [ "\$native_v4" != "\$(ip -4 -o addr show dev warp0 | awk '{print \$4}' | cut -d/ -f1 | head -n 1)" ] && ip rule add priority 188 from "\$native_v4/32" lookup main
+    ip rule add not fwmark 51819 lookup 51820 priority 200
+fi
+if [ "$WARP_FAMILY" != ipv4 ] && [ "$WARP_SCOPE" = global ]; then
+    ip -6 rule add priority 190 lookup main suppress_prefixlength 0
+    # 已绑定原生 IPv6 地址的 SSH 等连接继续走原生路由。
+    native_v6=\$(ip -6 route get 2606:4700:4700::1111 mark 51819 2>/dev/null | sed -n 's/.* src \([^ ]*\).*/\1/p' | head -n 1)
+    [ -n "\$native_v6" ] && ip -6 rule add priority 188 from "\$native_v6/128" lookup main
+    ip -6 rule add not fwmark 51819 lookup 51820 priority 200
 fi
 
 # 关闭全网卡 rp_filter 严格反向路径过滤
@@ -696,14 +801,22 @@ fi
 
 # 5. iptables / ip6tables 标记匹配 ipset 的流量
 iptables -t mangle -D OUTPUT -m set --match-set warp_unlock dst -j MARK --set-mark 51820 2>/dev/null || true
+if [ "$WARP_FAMILY" != ipv6 ]; then
 iptables -t mangle -A OUTPUT -m set --match-set warp_unlock dst -j MARK --set-mark 51820
+fi
 iptables -t mangle -D PREROUTING -m set --match-set warp_unlock dst -j MARK --set-mark 51820 2>/dev/null || true
+if [ "$WARP_FAMILY" != ipv6 ]; then
 iptables -t mangle -A PREROUTING -m set --match-set warp_unlock dst -j MARK --set-mark 51820
+fi
 
 ip6tables -t mangle -D OUTPUT -m set --match-set warp_unlock6 dst -j MARK --set-mark 51820 2>/dev/null || true
+if [ "$WARP_FAMILY" != ipv4 ]; then
 ip6tables -t mangle -A OUTPUT -m set --match-set warp_unlock6 dst -j MARK --set-mark 51820 2>/dev/null || true
+fi
 ip6tables -t mangle -D PREROUTING -m set --match-set warp_unlock6 dst -j MARK --set-mark 51820 2>/dev/null || true
+if [ "$WARP_FAMILY" != ipv4 ]; then
 ip6tables -t mangle -A PREROUTING -m set --match-set warp_unlock6 dst -j MARK --set-mark 51820 2>/dev/null || true
+fi
 
 # 6. TCP MSS 钳制 (解决 HTTPS / TLS Client Hello 大包导致 ERR_CONNECTION_CLOSED)
 iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
@@ -867,6 +980,9 @@ refresh_warp_ip() {
         wg-quick up warp0 || true
         echo -e "${RED}[错误] 新配置启动失败，已尝试恢复旧配置；旧账号尚未注销。${NC}"
         return 1
+    fi
+    if [ -x /usr/local/bin/warp-route-apply.sh ]; then
+        /usr/local/bin/warp-route-apply.sh || return 1
     fi
     ( umask 077; cat > /etc/wireguard/warp-account.conf << EOF
 DEV_ID=$NEW_DEV_ID
@@ -1114,6 +1230,7 @@ smart_install_flow() {
 
     if check_native_songzhong; then
         echo -e "\n${YELLOW}>>> 检测到原生 IP 已送中，全自动启动 WARP 动态分流解锁流程...${NC}"
+        select_exit_policy || return 1
         install_dependencies
         setup_warp_profile || return 1
         setup_dnsmasq_rules
@@ -1130,6 +1247,7 @@ smart_install_flow() {
         case "$force_choice" in
             [yY][eE][sS]|[yY])
                 echo -e "\n${YELLOW}>>> 开始安装 WARP 动态分流解锁...${NC}"
+                select_exit_policy || return 1
                 install_dependencies
                 setup_warp_profile || return 1
                 setup_dnsmasq_rules
@@ -1173,9 +1291,10 @@ echo "2. 强制安装 / 修复 WARP 动态解锁"
 echo "3. 测试当前解锁与归属状态"
 echo "4. 彻底卸载恢复原生网络"
 echo "5. 智能刷新 WARP 出口 IP (自动避开俄罗斯/中国，刷美区)"
+echo "6. 修改 WARP 出口协议、范围与地址优先级"
 echo "0. 退出"
 echo ""
-read -p "请输入选项 [0-5] (默认按回车直接智能运行 [1]): " choice
+read -p "请输入选项 [0-6] (默认按回车直接智能运行 [1]): " choice
 choice=${choice:-1}
 
 case $choice in
@@ -1185,6 +1304,7 @@ case $choice in
     2)
         auto_clean_old_warp
         detect_network_environment
+        select_exit_policy || exit 1
         install_dependencies
         setup_warp_profile || exit 1
         setup_dnsmasq_rules
@@ -1198,6 +1318,9 @@ case $choice in
         ;;
     4)
         auto_clean_old_warp
+        ADDRESS_PREFERENCE=default
+        apply_address_preference || exit 1
+        rm -f "$WARP_POLICY_FILE"
         echo -e "${GREEN}✓ 已彻底卸载并恢复原生网络配置。${NC}"
         ;;
     5)
@@ -1205,6 +1328,15 @@ case $choice in
         refresh_warp_ip || exit 1
         ensure_clean_warp_region || exit 1
         test_unlock_status
+        ;;
+    6)
+        if [ ! -f /etc/wireguard/warp0.conf ]; then
+            echo '请先安装 WARP。'
+            exit 1
+        fi
+        select_exit_policy || exit 1
+        setup_routing_rules || exit 1
+        echo '出口设置已更新。'
         ;;
     *)
         exit 0

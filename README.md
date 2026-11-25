@@ -6,7 +6,7 @@
 
 专为 Linux VPS 打造的**系统底层智能动态分流解锁方案**。原生深度适配**单栈 IPv6 (IPv6-Only VPS)**、双栈以及传统 IPv4 VPS 环境。针对 Google 全家桶、Google Play 商店、谷歌学术、YouTube Premium 以及主流 AI 服务（Gemini / ChatGPT / Claude）实现**精准定向分流**。
 
-非目标流量（如 x.com、GitHub、普通外网访问等）**100% 走 VPS 原生网络**，既完美解除限制，又保持原生速度与低延迟！在单栈 IPv6 机子上，更能赋予其针对目标服务的完整 IPv4 出网访问能力。
+默认对目标服务使用 WARP，其余流量使用原生网络；IPv6-only VPS 选择 WARP IPv4 时，IPv4 流量默认通过 WARP。也可选择所需协议全部走 WARP。
 
 ---
 
@@ -37,6 +37,13 @@ bash <(curl -sL https://raw.githubusercontent.com/zhicheng233/Warp-V6Only-Google
 > 3. `测试当前解锁与归属状态`
 > 4. `彻底卸载恢复原生网络`
 > 5. `智能刷新 WARP 出口 IP`（自动避开受限地区，刷美区）
+> 6. `修改 WARP 出口协议、范围与地址优先级`
+
+安装时和选项 6 可选择 WARP 承载 IPv4、IPv6 或两者，以及仅目标服务分流或全局出口。WARP 账号同时提供两种隧道地址；这里选择的是参与路由的协议，不是向 VPS 分配独占的公网地址，也不能保证出口 IP 不被封锁。在 IPv6-only VPS 上，选择 IPv4 时会提供默认 IPv4 出口，未选择的 IPv6 流量仍使用原生网络。选择仅 IPv6 时不会提供 WARP 默认 IPv4 出口。
+
+优先级可选系统默认、IPv4 优先或 IPv6 优先，通过 `/etc/gai.conf` 的受管理区块影响遵循 glibc `getaddrinfo` 排序的本机程序；明确指定地址族、使用自带解析器的程序和转发客户端可能不受影响。脚本不会覆盖已有的自定义 `precedence` 配置。卸载时会移除自己的配置区块。
+
+全局模式会修改所选地址族的默认策略路由；已有其他 WireGuard/WARP 隧道时应先检查地址、策略和防火墙是否冲突。特别是多个 WARP 接口共享 `172.16.0.2` 时，其他接口的防伪造规则可能拦截回包。建议通过控制台操作，以便必要时恢复网络。
 
 ---
 
