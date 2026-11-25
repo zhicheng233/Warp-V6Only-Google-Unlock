@@ -353,13 +353,21 @@ setup_warp_profile() {
     local INSTALL_ID FCM_TOKEN
     INSTALL_ID=$(head -c 16 /dev/urandom | base32 2>/dev/null | tr '[:upper:]' '[:lower:]' | head -c 22)
     [ -z "$INSTALL_ID" ] && INSTALL_ID=$(tr -dc 'a-z0-9' </dev/urandom | head -c 22)
-    FCM_TOKEN="${INSTALL_ID}:APA91b$(head -c 96 /dev/urandom | base32 2>/dev/null | tr '[:upper:]' '[:lower:]' | head -c 134)"
+    FCM_TOKEN="${INSTALL_ID}:APA91b$(head -c 96 /dev/urandom | base32 2>/dev/null | tr -d '\n=' | tr '[:upper:]' '[:lower:]' | head -c 134)"
     [ -z "$FCM_TOKEN" ] && FCM_TOKEN="${INSTALL_ID}:APA91b$(tr -dc 'a-z0-9' </dev/urandom | head -c 134)"
 
-    local RESPONSE
-    RESPONSE=$(curl $CF_CURL_OPT -s -X POST -H 'User-Agent: okhttp/3.12.1' -H 'CF-Client-Version: a-6.3-2158' -H 'Content-Type: application/json' \
+    local RESPONSE HTTP_STATUS CURL_STATUS API_ERROR
+    RESPONSE=$(curl $CF_CURL_OPT -sS --connect-timeout 8 --max-time 20 -w '\n%{http_code}' -X POST -H 'User-Agent: okhttp/3.12.1' -H 'CF-Client-Version: a-6.3-2158' -H 'Content-Type: application/json' \
       -d "{\"key\":\"$PUBKEY\",\"install_id\":\"$INSTALL_ID\",\"fcm_token\":\"$FCM_TOKEN\",\"tos\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\",\"model\":\"PC\",\"serial_number\":\"$INSTALL_ID\",\"locale\":\"en_US\"}" \
-      https://api.cloudflareclient.com/v0a2158/reg 2>/dev/null)
+      https://api.cloudflareclient.com/v0a2158/reg)
+    CURL_STATUS=$?
+    HTTP_STATUS=${RESPONSE##*$'\n'}
+    RESPONSE=${RESPONSE%$'\n'*}
+    if [ "$CURL_STATUS" -ne 0 ] || [[ ! "$HTTP_STATUS" =~ ^2[0-9][0-9]$ ]]; then
+        API_ERROR=$(jq -r '[.errors[]? | select(.code != null) | .code | tostring] | join(", ")' <<< "$RESPONSE" 2>/dev/null)
+        echo -e "${RED}[错误] Cloudflare 注册请求失败 (curl: $CURL_STATUS，HTTP: ${HTTP_STATUS:-未知}，错误码: ${API_ERROR:-无})。${NC}"
+        return 1
+    fi
 
     local IPV4_ADDR="" IPV6_ADDR="" PEER_PUBKEY=""
     if command -v jq &>/dev/null; then
@@ -405,24 +413,6 @@ setup_warp_profile() {
         if [[ "$TARGET_EP" != *:* ]]; then
             TARGET_EP="${WARP_ENDPOINTS[0]}"
         fi
-    fi
-
-    # 备用 API 兜底
-    if [ -z "$RESPONSE" ] || echo "$RESPONSE" | grep -q '"success":false'; then
-        RESPONSE=$(curl $CF_CURL_OPT -s -X POST -H 'User-Agent: okhttp/3.12.1' -H 'Content-Type: application/json' \
-          -d "{\"key\":\"$PUBKEY\",\"tos\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\"}" \
-          https://api.cloudflareclient.com/v0a884/reg 2>/dev/null)
-        local V6_BACKUP
-        V6_BACKUP=$(echo "$RESPONSE" | grep -oP '"addresses"\s*:\s*\{[^}]*"v6"\s*:\s*"\K[0-9a-fA-F:]+' | head -n 1)
-        [ -n "$V6_BACKUP" ] && IPV6_ADDR="$V6_BACKUP"
-        local PUB_BACKUP
-        PUB_BACKUP=$(echo "$RESPONSE" | grep -oP '"public_key"\s*:\s*"\K[^"]+' | head -n 1)
-        [ -n "$PUB_BACKUP" ] && PEER_PUBKEY="$PUB_BACKUP"
-    fi
-
-    if [ -z "$PEER_PUBKEY" ]; then
-        echo -e "${RED}[错误] 无法获取 Cloudflare 授权，请检查 VPS 出口网络与 IPv6/IPv4 连接后重试！${NC}"
-        exit 1
     fi
 
     # 激活 Cloudflare WARP 官方账号授权 (warp_enabled: true)
@@ -787,7 +777,7 @@ refresh_warp_ip() {
     local INSTALL_ID FCM_TOKEN
     INSTALL_ID=$(head -c 16 /dev/urandom | base32 2>/dev/null | tr '[:upper:]' '[:lower:]' | head -c 22)
     [ -z "$INSTALL_ID" ] && INSTALL_ID=$(tr -dc 'a-z0-9' </dev/urandom | head -c 22)
-    FCM_TOKEN="${INSTALL_ID}:APA91b$(head -c 96 /dev/urandom | base32 2>/dev/null | tr '[:upper:]' '[:lower:]' | head -c 134)"
+    FCM_TOKEN="${INSTALL_ID}:APA91b$(head -c 96 /dev/urandom | base32 2>/dev/null | tr -d '\n=' | tr '[:upper:]' '[:lower:]' | head -c 134)"
     [ -z "$FCM_TOKEN" ] && FCM_TOKEN="${INSTALL_ID}:APA91b$(tr -dc 'a-z0-9' </dev/urandom | head -c 134)"
 
     # 5. 请求 Cloudflare 注册全新账号
