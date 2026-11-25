@@ -23,7 +23,7 @@ Guidance for AI agents working in `Warp-V6Only-Google-Unlock`.
 - **Immutable `/etc/resolv.conf`**: The script sets `chattr +i /etc/resolv.conf` pointing to `127.0.0.1` (backed up at `/etc/resolv.conf.warp.bak`). Any script modifying DNS must execute `chattr -i /etc/resolv.conf` before editing.
 - **`systemd-resolved` Collision**: Port 53 must be freed for `dnsmasq`. The script explicitly stops and disables `systemd-resolved`.
 - **Deliberate QUIC (UDP 443) Drop**: Mangle/filter rules deliberately REJECT UDP 443 for IPs in `warp_unlock`/`warp_unlock6` (`--reject-with icmp-port-unreachable` for IPv4 and `--reject-with icmp6-port-unreachable` for IPv6). This forces browsers to fall back to TCP (TLS 1.3), preventing HTTP/3 packet drops caused by WireGuard MTU issues. Do NOT remove this rejection.
-- **Dual-Stack MSS Clamping & MTU**: WireGuard interface `warp0` uses MTU `1200` and iptables/ip6tables TCPMSS clamping (`--clamp-mss-to-pmtu`) to prevent TLS handshake drops (`ERR_CONNECTION_CLOSED`).
+- **Dual-Stack MSS Clamping & MTU**: WireGuard interface `warp0` uses MTU `1280`, the IPv6 minimum, and iptables/ip6tables TCPMSS clamping (`--clamp-mss-to-pmtu`) to mitigate TLS handshake drops (`ERR_CONNECTION_CLOSED`). An MTU below 1280 disables IPv6 on the interface.
 
 ## Architecture & Code Flow (`warp-google.sh`)
 

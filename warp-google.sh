@@ -380,9 +380,10 @@ setup_warp_profile() {
     [ -z "$IPV6_ADDR" ] && IPV6_ADDR=$(echo "$RESPONSE" | grep -oP '"addresses"\s*:\s*\{[^}]*"v6"\s*:\s*"\K[0-9a-fA-F:]+' | head -n 1)
     [ -z "$PEER_PUBKEY" ] && PEER_PUBKEY=$(echo "$RESPONSE" | grep -oP '"public_key"\s*:\s*"\K[^"]+' | head -n 1)
 
-    IPV4_ADDR=${IPV4_ADDR:-172.16.0.2}
-    IPV6_ADDR=${IPV6_ADDR:-2606:4700:110:8827:18b5:2de8:8b53:96e3}
-    PEER_PUBKEY=${PEER_PUBKEY:-bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=}
+    if [ -z "$PRIVKEY" ] || [ -z "$PUBKEY" ] || [ -z "$IPV4_ADDR" ] || [ -z "$IPV6_ADDR" ] || [ -z "$PEER_PUBKEY" ]; then
+        echo -e "${RED}[错误] WARP 注册失败或返回配置不完整，停止安装。${NC}"
+        return 1
+    fi
 
     # 尝试从 API 中自动提取 Cloudflare 推荐的 IPv6 端点 (并纠正 API 的 :0 占位端口)
     if [ $IS_V6_ONLY -eq 1 ]; then
@@ -440,10 +441,12 @@ setup_warp_profile() {
             echo -e "${GREEN}✓ Cloudflare WARP 官方授权已成功激活 (warp_enabled: true)${NC}"
         fi
 
-        cat > /etc/wireguard/warp-account.conf << EOF
+        ( umask 077; cat > /etc/wireguard/warp-account.conf << EOF
 DEV_ID=$DEV_ID
 TOKEN=$TOKEN
 EOF
+        )
+        chmod 600 /etc/wireguard/warp-account.conf
     fi
 
     # 构建针对单栈 IPv6 与双栈自适应的 PostUp 规则
@@ -452,12 +455,12 @@ EOF
         V6_ONLY_EXTRA_POSTUP="ip route replace default dev warp0 table main 2>/dev/null || true; ip rule add lookup 51820 priority 200 2>/dev/null || true;"
     fi
 
-    # 显式设置 MTU=1200 杜绝大包分片断网，Keepalive=10 彻底稳固 NAT 映射
-    cat > /etc/wireguard/warp0.conf << EOF
+    # IPv6 要求接口 MTU 至少 1280；过低会导致内核禁用接口 IPv6。
+    ( umask 077; cat > /etc/wireguard/warp0.conf << EOF
 [Interface]
 PrivateKey = $PRIVKEY
 Address = ${IPV4_ADDR}/32, ${IPV6_ADDR}/128
-MTU = 1200
+MTU = 1280
 Table = off
 PostUp = ip rule add fwmark 51820 lookup 51820 priority 100 2>/dev/null || true; ip rule add oif warp0 lookup 51820 priority 90 2>/dev/null || true; ip rule add from 172.16.0.0/12 lookup 51820 priority 90 2>/dev/null || true; ip route replace default dev warp0 table 51820; ${V6_ONLY_EXTRA_POSTUP} iptables -t nat -D POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null || true; iptables -t nat -A POSTROUTING -o warp0 -j MASQUERADE; iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true; iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu; ip -6 rule add fwmark 51820 lookup 51820 priority 100 2>/dev/null || true; ip -6 rule add oif warp0 lookup 51820 priority 90 2>/dev/null || true; ip -6 rule add from ${IPV6_ADDR} lookup 51820 priority 90 2>/dev/null || true; ip -6 route replace default dev warp0 table 51820 2>/dev/null || true; ip6tables -t nat -D POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null || true; ip6tables -t nat -A POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null || true; ip6tables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true; ip6tables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
 PostDown = ip route del default dev warp0 table main 2>/dev/null || true; ip route flush table 51820 2>/dev/null || true; ip -6 route flush table 51820 2>/dev/null || true; ip rule del oif warp0 lookup 51820 2>/dev/null || true; ip rule del from 172.16.0.0/12 lookup 51820 2>/dev/null || true; ip rule del lookup 51820 priority 200 2>/dev/null || true; ip -6 rule del oif warp0 lookup 51820 2>/dev/null || true; ip -6 rule del from ${IPV6_ADDR} lookup 51820 2>/dev/null || true
@@ -468,6 +471,8 @@ Endpoint = $TARGET_EP
 AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 10
 EOF
+    )
+    chmod 600 /etc/wireguard/warp0.conf
 
     echo -e "${GREEN}✓ Cloudflare WARP 节点配置已生成 (Endpoint: $TARGET_EP)${NC}"
 }
@@ -601,6 +606,14 @@ setup_routing_rules() {
 sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
 sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
 sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1
+# 开启转发前保留原本通过路由通告获取 IPv6 默认路由的接口。
+for ra_file in /proc/sys/net/ipv6/conf/*/accept_ra; do
+    [ -f "\$ra_file" ] || continue
+    if [ "\$(cat "\$ra_file" 2>/dev/null)" = 1 ]; then
+        ra_iface=\${ra_file%/accept_ra}; ra_iface=\${ra_iface##*/}
+        sysctl -w "net.ipv6.conf.\$ra_iface.accept_ra=2" >/dev/null 2>&1 || true
+    fi
+done
 sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1
 
 # 1. 创建 ipset 集合 (IPv4 与 IPv6 双栈集合，86400秒超时)
@@ -630,7 +643,10 @@ ip -6 rule add oif warp0 lookup 51820 priority 90 2>/dev/null || true
 
 # 3. 启动 WireGuard 虚拟网卡
 wg-quick down warp0 >/dev/null 2>&1 || true
-wg-quick up warp0 >/dev/null 2>&1
+if ! wg-quick up warp0; then
+    echo "[错误] warp0 启动失败，请检查上方 wg-quick 错误。" >&2
+    exit 1
+fi
 
 # 4. 确保 51820 路由表的默认网关为 warp0 虚拟接口 (双栈)
 ip route flush table 51820 2>/dev/null || true
@@ -723,7 +739,7 @@ ip6tables -t filter -D OUTPUT -p udp --dport 443 -m set --match-set warp_unlock6
 ip6tables -t filter -A OUTPUT -p udp --dport 443 -m set --match-set warp_unlock6 dst -j REJECT --reject-with icmp6-port-unreachable 2>/dev/null || true
 EOF
     chmod +x /usr/local/bin/warp-route-apply.sh
-    /usr/local/bin/warp-route-apply.sh
+    /usr/local/bin/warp-route-apply.sh || return 1
 
     # 注册 systemd 开机自启
     cat > /etc/systemd/system/warp-unlock.service << 'EOF'
@@ -747,7 +763,7 @@ EOF
 # 核心功能：全自动注销并获取新账号以真正更换出口 IP
 # ---------------------------------------------------------
 refresh_warp_ip() {
-    echo -e "\n${CYAN}>>> 正在执行 WARP 出口 IP 深度换新 (注销旧设备 -> 注入随机指纹 -> 获取全新出口 IP)...${NC}"
+    echo -e "\n${CYAN}>>> 正在注册新的 WARP 账号并验证出口...${NC}"
     [ -z "$WARP_ENDPOINTS" ] && detect_network_environment
 
     local OLD_IP
@@ -755,19 +771,11 @@ refresh_warp_ip() {
     [ -z "$OLD_IP" ] && OLD_IP=$(curl -s --interface warp0 --max-time 4 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep "^ip=" | cut -d= -f2)
     [ -n "$OLD_IP" ] && echo -e "当前旧出口 IP: ${YELLOW}${OLD_IP}${NC}"
 
-    # 1. 停用当前 WireGuard 接口
-    wg-quick down warp0 >/dev/null 2>&1 || true
-
-    # 2. 向 Cloudflare 官方 API 发送 DELETE 注销旧设备
+    # 保留旧账号，直到新注册已验证成功。
+    local OLD_ID OLD_TOKEN
     if [ -f /etc/wireguard/warp-account.conf ]; then
-        local OLD_ID OLD_TOKEN
         OLD_ID=$(awk -F= '/^DEV_ID=/{print $2}' /etc/wireguard/warp-account.conf 2>/dev/null)
         OLD_TOKEN=$(awk -F= '/^TOKEN=/{print $2}' /etc/wireguard/warp-account.conf 2>/dev/null)
-        if [ -n "$OLD_ID" ] && [ -n "$OLD_TOKEN" ]; then
-            echo -e "${YELLOW}正在向 Cloudflare 注销旧设备 (${OLD_ID:0:8}...) 释放旧 IP 映射...${NC}"
-            curl $CF_CURL_OPT -s -m 4 -X DELETE -H "Authorization: Bearer $OLD_TOKEN" "https://api.cloudflareclient.com/v0a2158/reg/$OLD_ID" >/dev/null 2>&1 || true
-            sleep 2
-        fi
     fi
 
     # 3. 生成全新私钥公钥
@@ -816,9 +824,10 @@ refresh_warp_ip() {
     [ -z "$IPV6_ADDR" ] && IPV6_ADDR=$(echo "$REG_RES" | grep -oP '"addresses"\s*:\s*\{[^}]*"v6"\s*:\s*"\K[0-9a-fA-F:]+' | head -n 1)
     [ -z "$PEER_PUBKEY" ] && PEER_PUBKEY=$(echo "$REG_RES" | grep -oP '"public_key"\s*:\s*"\K[^"]+' | head -n 1)
 
-    IPV4_ADDR=${IPV4_ADDR:-172.16.0.2}
-    IPV6_ADDR=${IPV6_ADDR:-2606:4700:110:8827:18b5:2de8:8b53:96e3}
-    PEER_PUBKEY=${PEER_PUBKEY:-bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=}
+    if [ -z "$PRIVKEY" ] || [ -z "$PUBKEY" ] || [ -z "$NEW_DEV_ID" ] || [ -z "$NEW_TOKEN" ] || [ -z "$IPV4_ADDR" ] || [ -z "$IPV6_ADDR" ] || [ -z "$PEER_PUBKEY" ]; then
+        echo -e "${RED}[错误] 新账号注册失败或配置不完整，保留原有账号和隧道。${NC}"
+        return 1
+    fi
 
     # 若为单栈 IPv6 则尝试获取动态推荐 IPv6 端点
     if [ $IS_V6_ONLY -eq 1 ]; then
@@ -848,13 +857,14 @@ refresh_warp_ip() {
           -d '{"warp_enabled":true}' \
           "https://api.cloudflareclient.com/v0a2158/reg/$NEW_DEV_ID" >/dev/null 2>&1 || true
 
-        cat > /etc/wireguard/warp-account.conf << EOF
-DEV_ID=$NEW_DEV_ID
-TOKEN=$NEW_TOKEN
-EOF
     fi
 
     # 7. 更新 /etc/wireguard/warp0.conf
+    if ! cp /etc/wireguard/warp0.conf /etc/wireguard/warp0.conf.refresh.bak; then
+        echo -e "${RED}[错误] 无法备份现有配置，停止刷新。${NC}"
+        return 1
+    fi
+    wg-quick down warp0 >/dev/null 2>&1 || true
     sed -i "s|PrivateKey = .*|PrivateKey = $PRIVKEY|" /etc/wireguard/warp0.conf
     sed -i "s|Address = .*|Address = ${IPV4_ADDR}/32, ${IPV6_ADDR}/128|" /etc/wireguard/warp0.conf
     [ -n "$PEER_PUBKEY" ] && sed -i "s|PublicKey = .*|PublicKey = $PEER_PUBKEY|" /etc/wireguard/warp0.conf
@@ -862,7 +872,18 @@ EOF
     sed -i "s|from [0-9a-fA-F:]\+ lookup 51820|from ${IPV6_ADDR} lookup 51820|g" /etc/wireguard/warp0.conf
 
     # 8. 重新拉起 WireGuard 接口并触发握手
-    wg-quick up warp0 >/dev/null 2>&1
+    if ! wg-quick up warp0; then
+        cp /etc/wireguard/warp0.conf.refresh.bak /etc/wireguard/warp0.conf
+        wg-quick up warp0 || true
+        echo -e "${RED}[错误] 新配置启动失败，已尝试恢复旧配置；旧账号尚未注销。${NC}"
+        return 1
+    fi
+    ( umask 077; cat > /etc/wireguard/warp-account.conf << EOF
+DEV_ID=$NEW_DEV_ID
+TOKEN=$NEW_TOKEN
+EOF
+    )
+    chmod 600 /etc/wireguard/warp-account.conf
     ping -c 1 -W 1 1.1.1.1 >/dev/null 2>&1 || true
     ping -6 -c 1 -W 1 2606:4700:4700::1111 >/dev/null 2>&1 || true
     sleep 3
@@ -882,11 +903,18 @@ EOF
     echo -e "Google 真实定位: [${GREEN}${NEW_GLOC:-未知}${NC}]"
     echo "--------------------------------------------------------"
 
-    if [ -n "$NEW_IP" ] && [ "$NEW_IP" != "$OLD_IP" ]; then
+    if [ -z "$NEW_IP" ] || ! grep -qx 'warp=on' <<< "$NEW_TRACE"; then
+        echo -e "${RED}[错误] 新账号未验证到 WARP 出口；旧账号尚未注销，旧配置保存在 warp0.conf.refresh.bak。${NC}"
+        return 1
+    fi
+    if [ -n "$OLD_ID" ] && [ -n "$OLD_TOKEN" ]; then
+        curl $CF_CURL_OPT -s -m 4 -X DELETE -H "Authorization: Bearer $OLD_TOKEN" "https://api.cloudflareclient.com/v0a2158/reg/$OLD_ID" >/dev/null 2>&1 || true
+    fi
+    if [ "$NEW_IP" != "$OLD_IP" ]; then
         echo -e "${GREEN}✓ 出口 IP 刷新成功！已成功切换至全新公网出口！${NC}"
         return 0
     else
-        echo -e "${YELLOW}✓ 账号已重新轮换建立 (出口 IP: ${NEW_IP:-未知})${NC}"
+        echo -e "${YELLOW}账号已更换，但出口 IP 未发生变化。${NC}"
         return 0
     fi
 }
@@ -959,24 +987,25 @@ ensure_clean_warp_region() {
         echo -e "[探测] 当前出口 IP: ${CYAN}${WARP_IP:-获取中}${NC} | Cloudflare地区: [${CF_LOC:-未知}] | YouTube地区: [${CUR_REGION:-未知}] | Google定位: [${GOOGLE_LOC:-未知}]"
 
         local IS_RESTRICTED=0
-        if [ "$CF_LOC" == "RU" ] || [ "$CF_LOC" == "CN" ] || [ "$CUR_REGION" == "RU" ] || [ "$CUR_REGION" == "CN" ]; then
-            IS_RESTRICTED=1
-        elif [ -z "$WARP_IP" ]; then
+        if [ -z "$WARP_IP" ] || ! grep -qx 'warp=on' <<< "$TRACE_INFO"; then
             if [ $retry_count -lt 2 ]; then
                 ((retry_count++))
                 sleep 2
                 continue
             fi
+            echo -e "${RED}[错误] 无法验证 Cloudflare WARP 出口，停止刷新账号。请检查 DNS、路由和隧道。${NC}"
+            return 1
+        elif [ "$CF_LOC" == "RU" ] || [ "$CF_LOC" == "CN" ] || [ "$CUR_REGION" == "RU" ] || [ "$CUR_REGION" == "CN" ]; then
             IS_RESTRICTED=1
         fi
 
         if [ $IS_RESTRICTED -eq 1 ]; then
             ((retry_count++))
             echo -e "${YELLOW}[尝试 $retry_count/$max_retries] 当前出口为受限区，正在深度换新账号注销旧 IP...${NC}"
-            refresh_warp_ip
+            refresh_warp_ip || return 1
             sleep 2
         else
-            echo -e "${GREEN}✓ 成功锁定 WARP 纯净出口 IP: ${WARP_IP} (地区: [${CF_LOC:-${CUR_REGION:-US}}]，完美支持 Google / Gemini / YouTube！)${NC}"
+            echo -e "${GREEN}✓ 已验证 WARP 出口 IP: ${WARP_IP} (地区: [${CF_LOC:-${CUR_REGION:-未知}}])${NC}"
             return 0
         fi
     done
@@ -1037,16 +1066,15 @@ test_unlock_status() {
     GOOGLE_CODE=$(curl -sI -o /dev/null -w "%{http_code}" -L --interface warp0 --max-time 8 https://www.google.com/ncr)
 
     # 3. 验证 Gemini / Antigravity
-    local GEMINI_RES
-    GEMINI_RES=$(curl -sL --interface warp0 --max-time 8 -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" -H "Accept-Language: en-US,en" https://gemini.google.com 2>&1)
-    local GEMINI_OK=1
+    local GEMINI_RES GEMINI_OK=unknown
+    GEMINI_RES=$(curl -fsSL --interface warp0 --max-time 8 -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" -H "Accept-Language: en-US,en" https://gemini.google.com 2>/dev/null) || GEMINI_RES=""
     if echo "$GEMINI_RES" | grep -qiE "not supported in your country|country_unavailable|not available in your region"; then
         GEMINI_OK=0
     fi
 
     # 4. 验证 OpenAI / ChatGPT
     local CHATGPT_CODE
-    CHATGPT_CODE=$(curl -sI -o /dev/null -w "%{http_code}" -L --max-time 8 https://chatgpt.com 2>/dev/null)
+    CHATGPT_CODE=$(curl -sI -o /dev/null -w "%{http_code}" -L --interface warp0 --max-time 8 https://chatgpt.com 2>/dev/null)
 
     echo "========================================================"
     echo -e "               🎉 解锁与脱离送中验证报告                 "
@@ -1058,29 +1086,34 @@ test_unlock_status() {
         echo -e "YouTube Premium 归属:        ${YELLOW}⚠ 归属俄罗斯 [RU] (免广告但 Gemini 不支持，建议选菜单 5 刷新)${NC}"
     elif echo "$YT_TEST" | grep -q "www.google.cn"; then
         echo -e "YouTube Premium 解锁:        ${RED}✗ 仍显示送中 (请检查 WARP 运行状态)${NC}"
+    elif [ -n "$YT_REG" ] && [ "$YT_REG" != "CN" ]; then
+        echo -e "YouTube Premium 归属:        ${GREEN}[$YT_REG] (仍需实际验证服务)${NC}"
     else
-        echo -e "YouTube Premium 解锁:        ${GREEN}✓ 成功脱离送中 (当前归属: [${YT_REG:-US}])${NC}"
+        echo -e "YouTube Premium 归属:        ${YELLOW}未知或受限 [${YT_REG:-未知}]${NC}"
     fi
 
     if [ "$GOOGLE_CODE" == "200" ]; then
-        echo -e "Google 搜索/API 解锁:        ${GREEN}✓ 解锁成功 (HTTP $GOOGLE_CODE，已脱离送中)${NC}"
+        echo -e "Google 搜索访问:             ${GREEN}HTTP $GOOGLE_CODE (地区需另行验证)${NC}"
     else
         echo -e "Google 搜索/API 解锁:        ${YELLOW}⚠ 状态码: $GOOGLE_CODE (200/302均属正常)${NC}"
     fi
 
-    if [ $GEMINI_OK -eq 1 ]; then
-        echo -e "Google Gemini / Antigravity: ${GREEN}✓ 正常可用 (地区已解锁)${NC}"
-    else
+    if [ "$GEMINI_OK" = 0 ]; then
         echo -e "Google Gemini / Antigravity: ${RED}✗ 当前地区受限 (不可用，建议选菜单 5 刷新)${NC}"
+    else
+        echo -e "Google Gemini / Antigravity: ${YELLOW}未验证 (网页响应不能证明账号可用)${NC}"
     fi
 
-    if [ "$CHATGPT_CODE" == "200" ] || [ "$CHATGPT_CODE" == "302" ] || [ "$CHATGPT_CODE" == "403" ]; then
-        echo -e "OpenAI / ChatGPT 访问状态:   ${GREEN}✓ 正常连通 (HTTP $CHATGPT_CODE)${NC}"
+    if [ "$CHATGPT_CODE" == "200" ] || [ "$CHATGPT_CODE" == "302" ]; then
+        echo -e "OpenAI / ChatGPT 网页响应:   ${GREEN}HTTP $CHATGPT_CODE (账号功能需另行验证)${NC}"
     else
         echo -e "OpenAI / ChatGPT 访问状态:   ${YELLOW}⚠ 状态码: $CHATGPT_CODE${NC}"
     fi
     echo "========================================================"
-    echo -e "${GREEN}🎉 部署完成！若需更换出口地区，可随时运行脚本选择选项 [5] 智能刷 IP！${NC}\n"
+    if [ -z "$WARP_V4_EXIT" ] && [ -z "$WARP_V6_EXIT" ]; then
+        echo -e "${RED}WARP 出口未验证，请检查 wg show warp0、IPv6 路由和 DNS。${NC}\n"
+        return 1
+    fi
 }
 
 # ---------------------------------------------------------
@@ -1092,10 +1125,10 @@ smart_install_flow() {
     if check_native_songzhong; then
         echo -e "\n${YELLOW}>>> 检测到原生 IP 已送中，全自动启动 WARP 动态分流解锁流程...${NC}"
         install_dependencies
-        setup_warp_profile
+        setup_warp_profile || return 1
         setup_dnsmasq_rules
-        setup_routing_rules
-        ensure_clean_warp_region
+        setup_routing_rules || return 1
+        ensure_clean_warp_region || return 1
         test_unlock_status
     else
         echo -e "\n${GREEN}======================================================${NC}"
@@ -1108,10 +1141,10 @@ smart_install_flow() {
             [yY][eE][sS]|[yY])
                 echo -e "\n${YELLOW}>>> 开始安装 WARP 动态分流解锁...${NC}"
                 install_dependencies
-                setup_warp_profile
+                setup_warp_profile || return 1
                 setup_dnsmasq_rules
-                setup_routing_rules
-                ensure_clean_warp_region
+                setup_routing_rules || return 1
+                ensure_clean_warp_region || return 1
                 test_unlock_status
                 ;;
             *)
@@ -1163,10 +1196,10 @@ case $choice in
         auto_clean_old_warp
         detect_network_environment
         install_dependencies
-        setup_warp_profile
+        setup_warp_profile || exit 1
         setup_dnsmasq_rules
-        setup_routing_rules
-        ensure_clean_warp_region
+        setup_routing_rules || exit 1
+        ensure_clean_warp_region || exit 1
         test_unlock_status
         ;;
     3)
@@ -1179,8 +1212,8 @@ case $choice in
         ;;
     5)
         detect_network_environment
-        refresh_warp_ip
-        ensure_clean_warp_region
+        refresh_warp_ip || exit 1
+        ensure_clean_warp_region || exit 1
         test_unlock_status
         ;;
     *)
