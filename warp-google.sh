@@ -181,6 +181,8 @@ EOF
 # ---------------------------------------------------------
 auto_clean_old_warp() {
     echo -e "${YELLOW}[深度清理] 正在深度检测并彻底清除所有 WARP 策略路由、防火墙规则及旧版残留...${NC}"
+    systemctl stop warp-health.timer warp-health.service 2>/dev/null || true
+    systemctl disable warp-health.timer 2>/dev/null || true
 
     # 0. 向 Cloudflare 释放旧设备注册 (解绑旧 IP 绑定)
     if [ -f /etc/wireguard/warp-account.conf ]; then
@@ -265,7 +267,10 @@ EOF
           /etc/dnsmasq.d/warp-google.conf \
           /etc/dnsmasq.d/warp*.conf \
           /usr/local/bin/warp-route-apply.sh \
+          /usr/local/bin/warp-health-check.sh \
           /etc/systemd/system/warp-unlock.service \
+          /etc/systemd/system/warp-health.service \
+          /etc/systemd/system/warp-health.timer \
           /etc/wireguard/warp0.conf* \
           /etc/wireguard/warp-account.conf* \
           /etc/wireguard/warp.conf* \
@@ -655,6 +660,76 @@ EOF
 # ---------------------------------------------------------
 # 配置系统级策略路由 (Ipset + Fwmark 双栈全覆盖)
 # ---------------------------------------------------------
+# 定时检测只读取状态并请求 trace，不因网络瞬断更换账号或修改路由。
+setup_health_monitor() {
+    cat > /usr/local/bin/warp-health-check.sh << 'EOF'
+#!/bin/bash
+set -u
+family=both
+policy=/etc/warp-unlock/exit-policy.conf
+if [ -f "$policy" ]; then
+    configured=$(sed -n 's/^family=//p' "$policy" | head -n 1)
+    case "$configured" in ipv4|ipv6|both) family=$configured ;; *) echo '[错误] 出口协议配置无效'; exit 1 ;; esac
+fi
+if ! wg show warp0 >/dev/null 2>&1; then
+    echo '[错误] 无法读取 warp0，WireGuard 接口不存在或不可用。'
+    exit 1
+fi
+failed=0
+for version in 4 6; do
+    [ "$family" = ipv4 ] && [ "$version" = 6 ] && continue
+    [ "$family" = ipv6 ] && [ "$version" = 4 ] && continue
+    trace=$(curl -sS -"$version" --noproxy '*' --interface warp0 --connect-timeout 5 --max-time 10 https://www.cloudflare.com/cdn-cgi/trace 2>&1) || {
+        echo "[错误] IPv${version} WARP 出口检测失败（网络、DNS 或超时）。"
+        failed=1
+        continue
+    }
+    ip=$(printf '%s\n' "$trace" | sed -n 's/^ip=//p' | head -n 1 | tr -d '\r')
+    loc=$(printf '%s\n' "$trace" | sed -n 's/^loc=//p' | head -n 1 | tr -d '\r')
+    warp=$(printf '%s\n' "$trace" | sed -n 's/^warp=//p' | head -n 1 | tr -d '\r')
+    if { [ "$warp" != on ] && [ "$warp" != plus ]; } || [ -z "$ip" ]; then
+        echo "[错误] IPv${version} 未验证到 WARP 出口（warp=${warp:-未知}）。"
+        failed=1
+    elif [ "$loc" = CN ] || [ "$loc" = RU ]; then
+        echo "[警告] IPv${version} WARP 出口 $ip 的 Cloudflare 地区为 $loc。"
+        failed=1
+    else
+        echo "[正常] IPv${version} WARP 出口 $ip，Cloudflare 地区 ${loc:-未知}。"
+    fi
+done
+exit "$failed"
+EOF
+    chmod 755 /usr/local/bin/warp-health-check.sh
+    cat > /etc/systemd/system/warp-health.service << 'EOF'
+[Unit]
+Description=WARP exit health check
+After=network-online.target warp-unlock.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/warp-health-check.sh
+EOF
+    cat > /etc/systemd/system/warp-health.timer << 'EOF'
+[Unit]
+Description=Periodically check WARP exits
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+RandomizedDelaySec=30s
+Unit=warp-health.service
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload || return 1
+    if ! systemctl enable --now warp-health.timer; then
+        echo -e "${RED}[错误] 无法启用 WARP 定时检测，请检查 systemd。${NC}"
+        return 1
+    fi
+    echo -e "${GREEN}✓ WARP 定时检测已启用：约每 10 分钟一次。${NC}"
+}
+
 setup_routing_rules() {
     echo -e "\n${CYAN}[4/4] 正在配置系统底层动态路由与开机守护...${NC}"
     load_exit_policy
@@ -860,6 +935,7 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     systemctl enable warp-unlock.service >/dev/null 2>&1
+    setup_health_monitor || return 1
 }
 
 # ---------------------------------------------------------
@@ -1292,9 +1368,10 @@ echo "3. 测试当前解锁与归属状态"
 echo "4. 彻底卸载恢复原生网络"
 echo "5. 智能刷新 WARP 出口 IP (自动避开俄罗斯/中国，刷美区)"
 echo "6. 修改 WARP 出口协议、范围与地址优先级"
+echo "7. 为现有 WARP 安装定时健康检查"
 echo "0. 退出"
 echo ""
-read -p "请输入选项 [0-6] (默认按回车直接智能运行 [1]): " choice
+read -p "请输入选项 [0-7] (默认按回车直接智能运行 [1]): " choice
 choice=${choice:-1}
 
 case $choice in
@@ -1337,6 +1414,13 @@ case $choice in
         select_exit_policy || exit 1
         setup_routing_rules || exit 1
         echo '出口设置已更新。'
+        ;;
+    7)
+        if [ ! -f /etc/wireguard/warp0.conf ]; then
+            echo '请先安装 WARP。'
+            exit 1
+        fi
+        setup_health_monitor || exit 1
         ;;
     *)
         exit 0

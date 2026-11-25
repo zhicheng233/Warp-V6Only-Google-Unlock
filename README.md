@@ -38,12 +38,23 @@ bash <(curl -sL https://raw.githubusercontent.com/zhicheng233/Warp-V6Only-Google
 > 4. `彻底卸载恢复原生网络`
 > 5. `智能刷新 WARP 出口 IP`（自动避开受限地区，刷美区）
 > 6. `修改 WARP 出口协议、范围与地址优先级`
+> 7. `为现有 WARP 安装定时健康检查`
 
 安装时和选项 6 可选择 WARP 承载 IPv4、IPv6 或两者，以及仅目标服务分流或全局出口。WARP 账号同时提供两种隧道地址；这里选择的是参与路由的协议，不是向 VPS 分配独占的公网地址，也不能保证出口 IP 不被封锁。在 IPv6-only VPS 上，选择 IPv4 时会提供默认 IPv4 出口，未选择的 IPv6 流量仍使用原生网络。选择仅 IPv6 时不会提供 WARP 默认 IPv4 出口。
 
 优先级可选系统默认、IPv4 优先或 IPv6 优先，通过 `/etc/gai.conf` 的受管理区块影响遵循 glibc `getaddrinfo` 排序的本机程序；明确指定地址族、使用自带解析器的程序和转发客户端可能不受影响。脚本不会覆盖已有的自定义 `precedence` 配置。卸载时会移除自己的配置区块。
 
 全局模式会修改所选地址族的默认策略路由；已有其他 WireGuard/WARP 隧道时应先检查地址、策略和防火墙是否冲突。特别是多个 WARP 接口共享 `172.16.0.2` 时，其他接口的防伪造规则可能拦截回包。建议通过控制台操作，以便必要时恢复网络。
+
+## 定时健康检查
+
+安装时会启用 `warp-health.timer`，开机约 2 分钟后及之后约每 10 分钟检测一次。它通过 `warp0` 检查所选 IPv4 / IPv6 出口的 Cloudflare trace、WARP 状态和地区；失败或地区为 CN/RU 时写入日志并返回失败。检测不会自动修复网络、注销账号或刷新出口，也不能证明 Google、YouTube 或 AI 服务一定可用。原有安装可运行新脚本选择菜单 7 安装定时器，不必重新注册。
+
+```bash
+systemctl list-timers warp-health.timer
+systemctl start warp-health.service
+journalctl -u warp-health.service -n 50 --no-pager
+```
 
 ---
 
